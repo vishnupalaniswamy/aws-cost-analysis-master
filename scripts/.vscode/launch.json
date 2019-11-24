@@ -1,0 +1,24 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "args": [
+        "--action=prepare-athena",
+        "--source-bucket=cost-and-usage-billing",
+        "--source-prefix=customer/vibrent/AWS-CURS/",
+        "--dest-bucket=cost-and-usage-athena", 
+        "--dest-prefix=customer/vibrent/",
+        "--year=2019",
+        "--month=01"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}
