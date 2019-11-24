@@ -6,6 +6,7 @@ import os
 import traceback
 import boto3
 import utils, consts
+import uuid
 from errors import ManifestNotFoundError, CurBucketNotFoundError
 
 from botocore.exceptions import ClientError as BotoClientError
@@ -38,6 +39,16 @@ class CostUsageProcessor():
 
         self.latest_manifest_key = self.get_latest_aws_manifest_key()
         self.curManifestJson = self.get_aws_manifest_content()
+
+        self.get_all_aws_manifest_keys()
+        
+        #
+        print "reportKeys: [{}]".format(self.curManifestJson['reportKeys'])
+
+        for i, key in enumerate(self.curManifestJson['reportKeys']):
+            self.curManifestJson['reportKeys'][i] = key.replace("curs/AWS-CURS", "customer/vibrent/AWS-CURS")
+
+        print "reportKeys: [{}]".format(self.curManifestJson['reportKeys'])
 
         if not self.accountId:
             self.accountId = self.curManifestJson.get('account','')
@@ -97,7 +108,7 @@ class CostUsageProcessor():
         record_count = 0
         if action == consts.ACTION_PREPARE_ATHENA:
             fileToUpload = finalLocalKey
-            finalS3Key = monthDestPrefix + "cost-and-usage-athena.csv.gz"
+            finalS3Key = monthDestPrefix + str(uuid.uuid1()) + "cost-and-usage-athena.csv.gz"
             with gzip.open(tmpLocalKey, 'rb') as f:
                 f.next()#skips first line for Athena files
                 #Write contents to another tmp file, which will be uploaded to S3
@@ -143,13 +154,14 @@ class CostUsageProcessor():
         print "Getting Manifest key for acccount:[{}] - bucket:[{}] - prefix:[{}]".format(self.accountId, self.sourceBucket, manifestprefix)
         manifest_key = ''
         try:
-            response = self.s3sourceclient.list_objects_v2(Bucket=self.sourceBucket,Prefix=manifestprefix)
+            response = self.s3sourceclient.list_objects_v2(Bucket=self.sourceBucket,Prefix=manifestprefix) #recursive
             #Get the latest manifest
             if 'Contents' in response:
                 for o in response['Contents']:
                     key = o['Key']
                     post_prefix = key[key.find(manifestprefix)+len(manifestprefix):]
-                    if '-Manifest.json' in key and post_prefix.find("/") < 0:#manifest file is at top level after prefix and not inside one of the folders
+                    #if '-Manifest.json' in key and post_prefix.find("/") < 0:#manifest file is at top level after prefix and not inside one of the folders
+                    if '-Manifest.json' in key: # Using the first manifest file for the month. how to deal with manifest change in between a month
                         manifest_key = key
                         break
 
@@ -177,12 +189,54 @@ class CostUsageProcessor():
         return manifest_key
 
 
+    def get_all_aws_manifest_keys(self):
+        manifestprefix = self.sourcePrefix + utils.get_period_prefix(self.year, self.month)
+        print "Getting Manifest key for acccount:[{}] - bucket:[{}] - prefix:[{}]".format(self.accountId, self.sourceBucket, manifestprefix)
+        manifest_key = []
+        try:
+            response = self.s3sourceclient.list_objects_v2(Bucket=self.sourceBucket,Prefix=manifestprefix) #recursive
+            #Get the latest manifest
+            if 'Contents' in response:
+                for o in response['Contents']:
+                    key = o['Key']
+                    post_prefix = key[key.find(manifestprefix)+len(manifestprefix):]
+                    #if '-Manifest.json' in key and post_prefix.find("/") < 0:#manifest file is at top level after prefix and not inside one of the folders
+                    if '-Manifest.json' in key: # Using the first manifest file for the month. how to deal with manifest change in between a month
+                        manifest_key.append(key)
+                        #break
+
+        except BotoClientError as bce:
+            self.status = consts.CUR_PROCESSOR_STATUS_ERROR
+            if bce.response['Error']['Code'] == 'NoSuchBucket':
+                self.statusDetails = bce.response['Error']['Code']
+                raise CurBucketNotFoundError("{} - bucket:[{}]".format(bce.message, self.sourceBucket))
+            else:
+                self.statusDetails = 'BotoClientError_'+bce.response['Error']['Code']
+                raise
+
+        except Exception as e:
+            self.status = consts.CUR_PROCESSOR_STATUS_ERROR
+            self.statusDetails = e.message
+            print "Error when getting manifest key for acccount:[{}] - bucket:[{}] - key:[{}]".format(self.accountId, self.sourceBucket, manifest_key)
+            print e.message
+            traceback.print_exc()
+
+        if not manifest_key:
+            self.status = consts.CUR_PROCESSOR_STATUS_ERROR
+            self.statusDetails = "ManifestNotFoundError - key:[{}]".format(manifest_key)
+            raise ManifestNotFoundError("Could not find manifest file in bucket:[{}]".format(self.sourceBucket))
+
+
+        print "Manifest Keys: [{}]".format(manifest_key)    
+        return manifest_key
+
+
     """
     Every time a new Cost and Usage report is generated, AWS updates a Manifest file with the S3 keys that
     correspond to the latest report. This method gets those keys.
     """
 
-    def get_latest_aws_cur_keys(self, bucket, prefix, s3client):
+    def get_latest_aws_cur_keys_v1(self, bucket, prefix, s3client):
         result = []
         print "Getting report keys for bucket:[{}] - prefix:[{}]".format(bucket,prefix)
         manifest_key = self.get_latest_aws_manifest_key()
@@ -199,10 +253,39 @@ class CostUsageProcessor():
         if 'Body' in response:
             manifest_json = json.loads(response['Body'].read())
             if 'reportKeys' in manifest_json:
+                for i, key in enumerate(manifest_json['reportKeys']):
+                    manifest_json['reportKeys'][i] = key.replace("curs/AWS-CURS", "customer/vibrent/AWS-CURS")
+
                 result = manifest_json['reportKeys']
 
         print "Latest Cost and Usage report keys: [{}]".format(result)
         return result
+
+    def get_latest_aws_cur_keys(self, bucket, prefix, s3client):
+        result = []
+        print "Getting report keys for bucket:[{}] - prefix:[{}]".format(bucket,prefix)
+        manifest_keys = self.get_all_aws_manifest_keys()
+
+        for manifest_key in manifest_keys:
+            response = {}
+            try:
+                print "Getting contents of manifest [{}]".format(manifest_key)
+                response = s3client.get_object(Bucket=bucket, Key=manifest_key)
+            except Exception as e:
+                self.status = consts.CUR_PROCESSOR_STATUS_ERROR
+                self.statusDetails = e.message
+                print "There was a problem getting object - bucket:[{}] - key [{}]".format(bucket, manifest_key)
+                print e.message
+
+            if 'Body' in response:
+                manifest_json = json.loads(response['Body'].read())
+                if 'reportKeys' in manifest_json:
+                    for i, key in enumerate(manifest_json['reportKeys']):
+                        manifest_json['reportKeys'][i] = key.replace("curs/AWS-CURS", "customer/vibrent/AWS-CURS")
+                        result.append(manifest_json['reportKeys'][i])
+
+        print "Latest Cost and Usage report keys: [{}]".format(result)
+        return result    
 
 
     """
